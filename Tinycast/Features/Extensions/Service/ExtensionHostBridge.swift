@@ -113,12 +113,15 @@ enum ExtensionHostError: LocalizedError {
     case noActiveExtension
     case unknown(String)
     case unsupported(String)
+    case forbiddenAccess(String)
 
     var errorDescription: String? {
         switch self {
         case .noActiveExtension: return "No extension command is running."
         case .unknown(let what): return "Unknown host call '\(what)'."
         case .unsupported(let what): return "\(what) is not supported in Tinycast extensions."
+        case .forbiddenAccess(let what):
+            return "\(what) refused: path is protected in Tinycast extensions."
         }
     }
 }
@@ -350,16 +353,23 @@ final class ExtensionHostBridge: ExtensionHostAPI {
 
         case "trash":
             let paths = (arguments.first?.arrayValue ?? []).compactMap(\.stringValue)
+            var failures = 0
             for path in paths {
                 let target = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
-                guard !ExtensionPathGuard.isForbiddenWrite(at: path) else { continue }
+                guard !ExtensionPathGuard.isForbiddenWrite(at: path) else {
+                    failures += 1
+                    continue
+                }
                 do {
                     try FileManager.default.trashItem(at: target, resultingItemURL: nil)
                 } catch {
                     // A silently swallowed failure lets an extension believe it deleted something.
+                    failures += 1
                     NSLog("Tinycast: extension trash failed for %@: %@", path, error.localizedDescription)
                 }
             }
+            // Report the refusal instead of a nil result the extension reads as success.
+            guard failures == 0 else { throw ExtensionHostError.forbiddenAccess("trash") }
             return nil
 
         case "applications":

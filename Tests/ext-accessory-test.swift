@@ -34,6 +34,7 @@ struct ExtensionSearchAccessoryTests {
         parsing()
         seeding()
         storageIsolation()
+        storageWriteRetry()
         print(failures == 0 ? "\nALL PASSED" : "\n\(failures) FAILED")
         print("\(passes) passed, \(failures) failed")
         exit(failures == 0 ? 0 : 1)
@@ -189,6 +190,34 @@ struct ExtensionSearchAccessoryTests {
         check(
             "a store with no accessory section keeps its preferences",
             older.preference(extension: "older", key: "token") == .string("secret"))
+    }
+
+    /// A failed flush stays dirty, so the next `flush()` retries without a fresh mutation — the
+    /// entry can't be lost just because the first write hit a full disk or a name collision.
+    static func storageWriteRetry() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tinycast-ext-storage-retry-\(UUID().uuidString)")
+        let block = directory.appendingPathComponent("sample.json")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let storage = ExtensionStorage(directory: directory)
+        storage.setLocalStorage(extension: "sample", key: "token", value: .string("secret"))
+        // An atomic write renames over an existing file, but a directory in the way forces a throw.
+        try? FileManager.default.createDirectory(at: block, withIntermediateDirectories: true)
+        storage.flush()
+        var isDirectory: ObjCBool = false
+        check(
+            "a blocked destination stays a directory after the failed write",
+            FileManager.default.fileExists(atPath: block.path, isDirectory: &isDirectory)
+                && isDirectory.boolValue)
+        try? FileManager.default.removeItem(at: block)
+        storage.flush()
+
+        let reloaded = ExtensionStorage(directory: directory)
+        check(
+            "a later flush retries a previously failed store",
+            reloaded.localStorageValue(extension: "sample", key: "token") == .string("secret"))
     }
 
     static func check(_ label: String, _ condition: Bool, _ detail: String = "") {

@@ -8,8 +8,7 @@ final class ExtensionNodeShims: @unchecked Sendable {
     private let fileManager = FileManager.default
     private var fileHandles: [Int32: FileHandle] = [:]
 
-    /// Off until a user-initiated command starts, on only while one is mounted. A background tick
-    /// has no one to ask, so `sh: -c` and friends are refused there outright.
+    /// On only while a user-initiated command is mounted; background ticks can ask no one.
     var allowsShellExec = false
 
     /// A lock flag like `O_EXLOCK` would block the JS queue with no way back.
@@ -428,6 +427,12 @@ final class ExtensionNodeShims: @unchecked Sendable {
             guard let resolved = ExtensionAsyncProcess.resolveExecutable(command) else {
                 throw ShimError.noEntry(command, "spawn")
             }
+            // A background tick can hand a shell path to `spawn` to get `-c` past the gate above.
+            guard allowsShellExec || !Self.isShellInterpreter(resolved) else {
+                throw ShimError.failed(
+                    "EPERM: shell execution is only allowed from an extension command you opened.",
+                    "EPERM")
+            }
             task.executableURL = resolved
             task.arguments = (spec["args"] as? [String] ?? [])
         }
@@ -455,6 +460,17 @@ final class ExtensionNodeShims: @unchecked Sendable {
         }
         if let input, let stdin { feed(input, to: stdin) }
         return ExtensionAsyncProcess.Child(task: task, stdout: stdout, stderr: stderr)
+    }
+
+    /// The interpreters a background tick must not be able to exec, matched by base name after
+    /// symlink resolution so `/bin/sh` and a bare `sh` off PATH both land here.
+    private static let shellInterpreterNames: Set<String> = [
+        "sh", "bash", "zsh", "ksh", "csh", "tcsh", "fish", "dash", "ash", "mksh", "pdksh",
+    ]
+
+    private static func isShellInterpreter(_ url: URL) -> Bool {
+        let resolved = url.resolvingSymlinksInPath().lastPathComponent
+        return shellInterpreterNames.contains(resolved)
     }
 
     /// A pipe holds 64 KB, so a larger input written before the child reads it would never finish.
@@ -679,16 +695,8 @@ extension Array {
     }
 }
 
-/// The one deny-list for every host-mediated write: the `fs` shims and `system.trash` share it, so a
-/// shell profile, a LaunchAgent or `/Applications` cannot be touched through either door.
-///
-/// Reads stay unrestricted on purpose — the host is unsigned and unsandboxed, so a path deny-list
-/// stops an overreaching extension's accident, not a motivated attacker. The JS queue is shared by
-/// every extension, so a per-run confirm would let one command wave through another's prompt;
-/// a constant deny-list cannot be talked past.
+/// The write deny-list shared by the `fs` shims and `system.trash`; reads stay unrestricted by design.
 enum ExtensionPathGuard {
-    private static let fileManager = FileManager.default
-
     /// Relative to the user's home: profiles and credential stores a launcher has no reason to write.
     private static let forbiddenHomeEntries = [
         ".zshrc", ".zprofile", ".zshenv", ".zlogin", ".bashrc", ".bash_profile", ".bash_login",
@@ -703,7 +711,7 @@ enum ExtensionPathGuard {
     static func isForbiddenWrite(at path: String) -> Bool {
         let target = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
             .standardizedFileURL.path
-        let home = fileManager.homeDirectoryForCurrentUser.standardizedFileURL.path
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
         if forbiddenRoots.contains(where: { target == $0 || target.hasPrefix($0 + "/") }) {
             return true
         }

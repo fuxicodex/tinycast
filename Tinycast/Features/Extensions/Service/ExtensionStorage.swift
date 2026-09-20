@@ -219,9 +219,7 @@ final class ExtensionStorage {
                 try JSONEncoder().encode(store)
                     .write(to: fileURL(for: name), options: .atomic)
             } catch {
-                // This file holds an extension's API keys and preferences; losing it silently
-                // logs the user out of every service the extension talks to. Keep the entry dirty
-                // so the next mutation retries; a retry loop here would spin on a full disk.
+                // The store holds API keys; losing it silently logs the user out, so stay dirty to retry.
                 NSLog("Tinycast: could not write extension storage for %@: %@", name, error.localizedDescription)
                 dirty.insert(name)
             }

@@ -23,7 +23,11 @@ jobs:
   test:
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v7
+      # Pin to a verified commit SHA so PR-controlled code never floats with the tag,
+      # and drop stored credentials so a malicious PR cannot lift them from the checkout.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       - name: Select Xcode 26
         run: |
@@ -40,7 +44,12 @@ jobs:
       # `xcodegen generate` would compile in the harnesses yet be missing from the app target.
       - name: Project file matches project.yml
         run: |
-          brew install xcodegen
+          # A pinned release, so the generated pbxproj matches the committed one on every run.
+          curl -fLsS -o /tmp/xcodegen.zip \
+            https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip
+          unzip -qo /tmp/xcodegen.zip -d "$RUNNER_TEMP/xcodegen"
+          echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
+          xcodegen version | grep -q 2.46.0
           xcodegen generate
           git diff --exit-code Tinycast.xcodeproj || {
             echo "::error::Tinycast.xcodeproj is stale — run 'xcodegen generate' and commit."

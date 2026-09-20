@@ -118,13 +118,14 @@ struct ExtensionTests {
         extensionName: String = "fixture", command: String = "fixture",
         mode: ExtensionCommandMode = .view, assets: String = "/tmp",
         preferences: [String: ExtensionPreferenceValue] = [:],
-        arguments: [String: String] = [:], isDarkAppearance: Bool = true
+        arguments: [String: String] = [:], isDarkAppearance: Bool = true,
+        launchType: ExtensionLaunchType = .userInitiated
     ) -> ExtensionLaunchContext {
         ExtensionLaunchContext(
             extensionName: extensionName, extensionTitle: extensionName, commandName: command,
             commandMode: mode, assetsPath: assets, supportPath: "/tmp",
             preferences: preferences, caches: [:], arguments: arguments, fallbackText: nil,
-            isDarkAppearance: isDarkAppearance)
+            launchType: launchType, isDarkAppearance: isDarkAppearance)
     }
 
     /// `EXT_TEST_ARGS="hours=0,minutes=5"` — stands in for the palette's inline argument fields.
@@ -235,6 +236,28 @@ struct ExtensionTests {
         check(
             "shell exec runs once a user command is mounted",
             allowed.contains("\"ok\":true"), allowed)
+
+        // A background tick must not smuggle a shell past the `shell: true` gate by spawning it
+        // directly — `/bin/sh` by path or a bare `sh` resolved through PATH.
+        let direct = ExtensionNodeShims()
+        let byPath = direct.perform(
+            api: "proc", method: "run",
+            argsJSON: "[{\"command\":\"/bin/sh\",\"args\":[\"-c\",\"true\"]}]")
+        check(
+            "a direct /bin/sh spawn is refused while unmounted",
+            byPath.contains("\"EPERM\"") && byPath.contains("\"ok\":false"), byPath)
+        let bareSh = direct.perform(
+            api: "proc", method: "run",
+            argsJSON: "[{\"command\":\"sh\",\"args\":[\"-c\",\"true\"]}]")
+        check(
+            "a bare sh off PATH is refused while unmounted",
+            bareSh.contains("\"EPERM\"") && bareSh.contains("\"ok\":false"), bareSh)
+        let nonShell = direct.perform(
+            api: "proc", method: "run",
+            argsJSON: "[{\"command\":\"/bin/echo\",\"args\":[\"ok\"]}]")
+        check(
+            "a non-shell command still runs while unmounted",
+            nonShell.contains("\"ok\":true"), nonShell)
     }
 
     static func nodeShimChecks() {
@@ -1187,9 +1210,64 @@ struct ExtensionTests {
             failingRecorder.failures.joined(separator: "|"))
         await failing.stop(session: "s3")
 
+        await shellAuthorizationTransitions()
         await swiftHelperChecks()
         await processKillChecks()
         zlibChecks()
+    }
+
+    /// Shell execution follows the *current* launch: a background tick refuses it, a user-initiated
+    /// command allows it, and the next background tick refuses it again — all on one mounted runtime.
+    @MainActor
+    static func shellAuthorizationTransitions() async {
+        let (runtime, _, recorder) = makeRuntime()
+        try? await runtime.boot(
+            config: .current(supportDirectory: FileManager.default.temporaryDirectory))
+        let code =
+            """
+            "use strict";
+            const { Detail } = require("@raycast/api");
+            const React = require("react");
+            const { execSync } = require("child_process");
+            module.exports.default = function Command() {
+              const [result, setResult] = React.useState("pending");
+              React.useEffect(() => {
+                try { execSync("true"); setResult("allowed"); }
+                catch (error) { setResult("refused:" + error.code); }
+              }, []);
+              return React.createElement(Detail, { markdown: result });
+            };
+            """
+
+        await runtime.start(
+            session: "sShellBg1", code: code, file: URL(fileURLWithPath: "/tmp/shell-auth.js"),
+            mode: .view, context: launchContext(mode: .view, launchType: .background))
+        await settle()
+        check(
+            "a background launch refuses shell execution",
+            recorder.trees.last?.activeRoot?.string("markdown") == "refused:EPERM",
+            recorder.trees.last?.activeRoot?.string("markdown") ?? "no tree")
+
+        await runtime.start(
+            session: "sShellUi", code: code, file: URL(fileURLWithPath: "/tmp/shell-auth.js"),
+            mode: .view, context: launchContext(mode: .view, launchType: .userInitiated))
+        await settle()
+        check(
+            "a user-initiated launch allows shell execution",
+            recorder.trees.last?.activeRoot?.string("markdown") == "allowed",
+            recorder.trees.last?.activeRoot?.string("markdown") ?? "no tree")
+
+        await runtime.start(
+            session: "sShellBg2", code: code, file: URL(fileURLWithPath: "/tmp/shell-auth.js"),
+            mode: .view, context: launchContext(mode: .view, launchType: .background))
+        await settle()
+        check(
+            "a later background launch refuses shell again",
+            recorder.trees.last?.activeRoot?.string("markdown") == "refused:EPERM",
+            recorder.trees.last?.activeRoot?.string("markdown") ?? "no tree")
+
+        await runtime.stop(session: "sShellBg2")
+        runtime.shutdown()
     }
 
     /// Drives a dropdown-filtered command from its empty first render to visible results.
